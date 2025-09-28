@@ -12,7 +12,7 @@ from collections import deque
 print("Loading assets...")
 
 # -- Configuration & Constants --
-VIDEO_PATH = 'videos/4ktraffic.mp4' # IMPORTANT: Use a video you did NOT train on
+VIDEO_PATH = 'car_approaching.mp4'
 MODEL_SAVE_PATH = 'trajectory_model.pth'
 SCALER_FILE = 'scaler.gz'
 DEVICE = 'cuda:0' if torch.cuda.is_available() else 'cpu'
@@ -27,11 +27,18 @@ HIDDEN_SIZE = 128
 NUM_LAYERS = 2
 
 # -- Threat Assessment Parameters --
-# Define a "danger zone" at the bottom of the screen (e.g., last 20% of the height)
-DANGER_ZONE_Y_START = 0.8  # Start at 80% of the frame height
-PROXIMITY_WEIGHT = 0.6     # How much proximity to the danger zone matters
-ANOMALY_WEIGHT = 0.4       # How much unpredictable movement matters
-ANOMALY_THRESHOLD = 15.0   # Pixel distance threshold to be considered an "anomaly"
+# The danger zone is now a circle in the center of the frame
+DANGER_ZONE_RADIUS_PERCENT = 0.25 # Radius is 25% of the frame's width
+DANGER_ZONE_CENTER = None # Will be calculated once we get the frame size
+
+# Weights for the three components of our threat score
+PROXIMITY_WEIGHT = 0.4     # Threat of entering personal space
+ANOMALY_WEIGHT = 0.2       # Threat of erratic movement
+LOOMING_WEIGHT = 0.4       # Threat of a direct head-on approach
+
+# Thresholds
+ANOMALY_THRESHOLD = 15.0   # Pixel distance to be considered an "anomaly"
+LOOMING_THRESHOLD = 1.15   # An object is "looming" if its size increases by 15%
 
 # -- Load Perception Models (YOLO + Tracker) --
 yolo_model = YOLO('yolov8n.pt')
@@ -69,16 +76,19 @@ print(f"Assets loaded. Running on device: {DEVICE}")
 # --- 2. SETUP FOR REAL-TIME PROCESSING ---
 
 # Dictionary to store the history of each track
-# The key is the track_id, the value is a deque (a fixed-size list)
 track_histories = {}
 # Dictionary to store the last predicted trajectory
 track_predictions = {}
 # Dictionary to store anomaly scores
 track_anomalies = {}
+# NEW: Dictionary to store the history of bounding box areas
+track_area_histories = {}
 
 cap = cv2.VideoCapture(VIDEO_PATH)
+frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-DANGER_ZONE_Y_PIXEL = int(frame_height * DANGER_ZONE_Y_START)
+DANGER_ZONE_CENTER = (frame_width // 2, frame_height // 2)
+DANGER_ZONE_RADIUS = int(frame_width * DANGER_ZONE_RADIUS_PERCENT)
 
 # --- 3. MAIN PROCESSING LOOP ---
 
@@ -97,6 +107,13 @@ while cap.isOpened():
     if tracks.shape[0] > 0:
         for track in tracks:
             x1, y1, x2, y2, track_id, conf, cls = track[:7]
+            area = (x2 - x1) * (y2 - y1)
+
+            if track_id not in track_area_histories:
+                track_area_histories[track_id] = deque(maxlen=HISTORY_LEN)
+
+            # Append the current area to this track's history
+            track_area_histories[track_id].append(area)
             track_id = int(track_id)
             current_track_ids.add(track_id)
 
@@ -178,6 +195,18 @@ while cap.isOpened():
             threat_score = 0.0
             proximity_score = 0.0
             anomaly_score = 0.0
+            looming_score = 0.0 # NEW: Initialize looming score
+
+            # NEW: Looming Score Calculation
+            if len(track_area_histories[track_id]) == HISTORY_LEN:
+                # Compare the average size of the object in the recent past vs. the distant past
+                areas = np.array(track_area_histories[track_id])
+                first_half_avg = np.mean(areas[:HISTORY_LEN // 2])
+                second_half_avg = np.mean(areas[HISTORY_LEN // 2:])
+
+                # Check for a significant, non-zero increase in size
+                if first_half_avg > 0 and second_half_avg > first_half_avg * LOOMING_THRESHOLD:
+                    looming_score = 1.0
             
             # Draw predicted path if it exists
             if track_id in track_predictions:
@@ -186,8 +215,11 @@ while cap.isOpened():
                     cv2.line(frame, tuple(path[i]), tuple(path[i+1]), (0, 255, 255), 2)
                 
                 # Proximity Score Calculation
-                if np.any(path[:, 1] > DANGER_ZONE_Y_PIXEL):
-                    proximity_score = 1.0 # Max score if any part of the path enters the zone
+                for point in path:
+                    distance_to_center = np.linalg.norm(point - DANGER_ZONE_CENTER)
+                    if distance_to_center < DANGER_ZONE_RADIUS:
+                        proximity_score = 1.0 # Max score if path enters the zone
+                        break # No need to check other points
             
             # Anomaly Score Calculation
             if track_id in track_anomalies and 'error' in track_anomalies[track_id]:
@@ -196,7 +228,9 @@ while cap.isOpened():
                 anomaly_score = min(error / ANOMALY_THRESHOLD, 1.0)
             
             # Final Weighted Threat Score
-            threat_score = (proximity_score * PROXIMITY_WEIGHT) + (anomaly_score * ANOMALY_WEIGHT)
+            threat_score = (proximity_score * PROXIMITY_WEIGHT) + \
+               (anomaly_score * ANOMALY_WEIGHT) + \
+               (looming_score * LOOMING_WEIGHT)
             
             # Determine BBox color based on threat
             color = (0, 255, 0) # Green (low threat)
@@ -208,8 +242,8 @@ while cap.isOpened():
             # Draw the bounding box and threat score
             x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(frame, f"ID: {track_id} | T: {threat_score:.2f}", (x1, y1 - 10), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            cv2.putText(frame, f"ID:{track_id} T:{threat_score:.2f} L:{looming_score:.0f}", (x1, y1 - 10), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
     # Clean up old tracks that are no longer in the frame
     for track_id in list(track_histories.keys()):
@@ -219,8 +253,7 @@ while cap.isOpened():
             if track_id in track_anomalies: del track_anomalies[track_id]
 
     # Draw the danger zone for visualization
-    cv2.line(frame, (0, DANGER_ZONE_Y_PIXEL), (frame.shape[1], DANGER_ZONE_Y_PIXEL), (255, 0, 255), 2)
-    cv2.putText(frame, "DANGER ZONE", (10, DANGER_ZONE_Y_PIXEL - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 255), 2)
+    cv2.circle(frame, DANGER_ZONE_CENTER, DANGER_ZONE_RADIUS, (255, 0, 255), 2)
 
     cv2.imshow("Dynamic Threat Assessment", frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
