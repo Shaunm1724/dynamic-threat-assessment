@@ -41,7 +41,7 @@ ANOMALY_THRESHOLD = 15.0   # Pixel distance to be considered an "anomaly"
 LOOMING_THRESHOLD = 1.15   # An object is "looming" if its size increases by 15%
 
 # -- Load Perception Models (YOLO + Tracker) --
-yolo_model = YOLO('yolov8n.pt')
+yolo_model = YOLO('yolo11s')
 tracker = DeepOcSort(
     reid_weights=Path('osnet_x0_25_msmt17.pt'),
     device=DEVICE,
