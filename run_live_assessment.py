@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import joblib
 from collections import deque
+from announcer import ThreatAnnouncer
 
 # --- 1. LOAD ALL ASSETS ---
 print("Loading assets...")
@@ -87,8 +88,11 @@ track_area_histories = {}
 cap = cv2.VideoCapture(VIDEO_PATH)
 frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+announcer = ThreatAnnouncer(frame_width)
 DANGER_ZONE_CENTER = (frame_width // 2, frame_height // 2)
 DANGER_ZONE_RADIUS = int(frame_width * DANGER_ZONE_RADIUS_PERCENT)
+
+coco_class_names = {0: 'person', 2: 'car', 3: 'motorcycle', 5: 'bus', 7: 'truck'}
 
 # --- 3. MAIN PROCESSING LOOP ---
 
@@ -96,6 +100,7 @@ while cap.isOpened():
     success, frame = cap.read()
     if not success:
         break
+    threats_in_frame = []
 
     # -- Perception Step --
     results = yolo_model(frame, classes=[0, 2, 3, 5, 7], conf=0.5, verbose=False)
@@ -195,7 +200,8 @@ while cap.isOpened():
             threat_score = 0.0
             proximity_score = 0.0
             anomaly_score = 0.0
-            looming_score = 0.0 # NEW: Initialize looming score
+            looming_score = 0.0
+            contextual_score = 0.0
 
             # NEW: Looming Score Calculation
             if len(track_area_histories[track_id]) == HISTORY_LEN:
@@ -232,6 +238,20 @@ while cap.isOpened():
                (anomaly_score * ANOMALY_WEIGHT) + \
                (looming_score * LOOMING_WEIGHT)
             
+            if threat_score > 0.5:
+                # Determine the primary reason for the threat
+                reasons = {'proximity': proximity_score, 'looming': looming_score, 'anomaly': anomaly_score, 'contextual': contextual_score}
+                primary_reason = max(reasons, key=reasons.get)
+
+                threat_info = {
+                    'id': track_id,
+                    'class_name': coco_class_names.get(int(cls), 'object'),
+                    'threat_score': threat_score,
+                    'primary_reason': primary_reason,
+                    'x_center': (x1 + x2) / 2
+                }
+                threats_in_frame.append(threat_info)
+            
             # Determine BBox color based on threat
             color = (0, 255, 0) # Green (low threat)
             if threat_score > 0.7:
@@ -254,6 +274,12 @@ while cap.isOpened():
 
     # Draw the danger zone for visualization
     cv2.circle(frame, DANGER_ZONE_CENTER, DANGER_ZONE_RADIUS, (255, 0, 255), 2)
+
+    message = announcer.generate_message(threats_in_frame)
+
+    if message:
+        print(message)
+        cv2.putText(frame, message, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
 
     cv2.imshow("Dynamic Threat Assessment", frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
